@@ -3,7 +3,7 @@
 > **What this is:** A running record of the recurring weak spots flagged across my DataLemur SQL sessions, newest first. Each item has a concrete before/after example. Use this as the pre-submit checklist and as the "what am I still getting wrong" tracker.
 >
 > **Repo path:** `data-engineering-interview-preparation/notes/sql_focus_areas.md`
-> **Last updated:** 11 Jul 2026 — 8 DataLemur Hards attempted (facebook MAU → mckinsey pizza); 6 logged below.
+> **Last updated:** 12 Jul 2026 — 🏁 **DataLemur free Hard set COMPLETE** (all free Easy + Medium + Hard done). Sessions 6–8 added: 4 official-solution critiques (repeat-caller → reactivation), senior-managers hierarchy, AWS fleet uptime.
 
 ---
 
@@ -31,6 +31,132 @@ Run this pass on every query *before* hitting submit. Every item traces back to 
 | 16 | **FLOOR physical counts** | Counts of indivisible units (batches, seats, items) = `FLOOR`, never `ROUND`. Rounding up overflows the physical capacity. |
 | 17 | **Join anchor = entity list** | Anchor on the table that *defines valid output rows* (`LEFT JOIN` from it). A payment / lookup / log table is never the anchor — `FULL`/`OUTER` joins leak phantom rows that don't belong in the output. |
 | 18 | **Constrain at source, don't filter after** | If I'm pruning overproduction with `DISTINCT` / a join-back / a long CASE ladder, the *generation* step is wrong. Fix it with conditional aggregation, a strict-inequality join, or an anchor join. |
+| 19 | **NULLIF the denominator** | Any growth-rate / ratio division needs `NULLIF(denom, 0)`. A zero prior-period makes Postgres raise a *hard* `division by zero` error — it does **not** return NULL. |
+| 20 | **Unique tiebreaker on ordered windows** | `LAG` / `LEAD` / `ROW_NUMBER` / `DISTINCT ON` need a deterministic unique sort key. If the business `ORDER BY` can tie (equal timestamps), append the PK (`transaction_id`). `DISTINCT ON` also requires the `ORDER BY` to *lead* with its key. |
+| 21 | **Don't filter away zero-counts** | Never `HAVING <computed aggregate> > 0` unless the spec explicitly excludes empty groups. A count of 0 is usually the answer, not noise to strip. |
+| 22 | **Gap-fill periods** | Period-over-period queries build the full calendar via `generate_series` + `LEFT JOIN`, not `GROUP BY` over rows that happen to exist. A missing month makes `LAG` compare non-adjacent periods. |
+
+---
+
+## 🗓️ Session 8 — 12 Jul 2026 (evening)
+**Milestone:** 🏁 **DataLemur free Hard set COMPLETE** — final Hard (AWS fleet uptime) solved solo and clean, no bugs. **Theme:** *Event-log → sessions via `LEAD`.*
+
+### 8.1 — Interleaved start/stop events → durations *(keeper pattern)*
+**Problem:** Sum total server uptime in whole days from a `start`/`stop` event log.
+**Pattern (transfers widely):** `LEAD(status_time)` within `partition by server_id order by status_time` pairs each event with the next; filter `WHERE session_status = 'start'` so each start matches its immediately-following stop → every interval counted exactly once, no self-join.
+
+```sql
+with sessions as (
+    select server_id, status_time as start_time,
+        lead(status_time) over (partition by server_id order by status_time) as stop_time,
+        session_status
+    from server_utilization
+)
+select floor(sum(extract(epoch from (stop_time - start_time))) / 86400) as total_uptime_days
+from sessions
+where session_status = 'start';
+```
+- Dangling final `start` with no stop → `LEAD` = NULL → `SUM` ignores it. Safe by default.
+- `FLOOR` for "full days" (checklist #16, now reflexive).
+- Same shape as session-duration, time-on-page, machine-uptime: anywhere paired `open`/`close` events sit in adjacent rows, `LEAD` + anchor-row filter beats a self-join.
+
+---
+
+## 🗓️ Session 7 — 12 Jul 2026 (morning)
+**Milestone:** Senior-managers hierarchy (manager-of-managers whose own reports aren't senior managers). Couldn't crack it solo — worked a friend's solution to full understanding + built alternatives. **Theme:** *Correlated subqueries & membership joins.* Technique acquisition, not a bug session — these recursion-adjacent hierarchy shapes are a known gap worth a default pattern.
+
+### 7.1 — Correlated subquery mechanics (`NOT EXISTS`)
+**Pattern:** The inner subquery re-runs once per outer row, substituting that row's values; `SELECT 1` is a throwaway payload (only existence matters). Read `NOT EXISTS` as a plain-English filter:
+
+```sql
+-- "keep this candidate only if NONE of its direct reports is itself a candidate"
+select c.manager_id
+from candidates c
+where not exists (
+    select 1 from employees e
+    where e.manager_id = c.manager_id                     -- this candidate's reports
+      and e.emp_id in (select manager_id from candidates) -- ...is any report also a candidate?
+);
+```
+Rick stays (neither report is a manager-of-managers); John drops (his report Rick *is* one).
+
+### 7.2 — SQL membership constructs → PySpark join types *(the keeper map)*
+DataFrame-API equivalents — no manual join keys faking a subquery:
+
+| SQL | PySpark | Use when |
+|---|---|---|
+| `WHERE x IN (subquery)` | `left_semi` | keep left rows that *have* a match; pull no columns from right |
+| `WHERE NOT EXISTS (corr. subquery)` | `left_anti` | keep left rows with *no* match |
+
+Reach for `left_semi` / `left_anti` whenever a subquery only tests membership rather than pulling columns — cheaper and clearer than an inner join + `distinct`.
+
+### 7.3 — `LEFT JOIN` (not INNER) to preserve `COUNT = 0`
+**Trap:** In the 2-join version, the grandchild join (`t3`: does this report itself manage someone?) must be `LEFT`. `INNER` drops a candidate whose report manages nobody, so `COUNT(...)` never gets to return 0 for them — they vanish instead of being evaluated. Same NULL-preservation logic as the zero-count work in 6.4.
+
+---
+
+## 🗓️ Session 6 — 11 Jul 2026 (afternoon)
+**Milestone:** 4 more DataLemur Hards reviewed — *critiquing the official solutions*, not my own drafts (repeat callers → reactivation count). **Theme:** *Determinism + zero-preservation.* Every bug here passes the dense example table and silently corrupts on the hidden set: either an ordered window with no unique tiebreaker (nondeterministic), or a clause that deletes a legitimate zero/edge row. A quiet failure family, opposite of Session 5's loud overproduction.
+
+### 6.1 — `DISTINCT ON` needs a matching `ORDER BY`
+**Problem:** UnitedHealth repeat callers (within 7-day intervals).
+**Trap:** `DISTINCT ON (col)` keeps "the first row per group" — but *which* row is first is undefined unless an `ORDER BY` leads with the same `DISTINCT ON` column(s). No `ORDER BY` → Postgres picks an arbitrary row per group, and it can change run to run.
+
+```sql
+-- ❌ BUG: which row survives per caller is nondeterministic
+select distinct on (caller_id) caller_id, call_time from calls;
+
+-- ✅ FIX: ORDER BY must lead with the DISTINCT ON key, then the real tiebreak
+select distinct on (caller_id) caller_id, call_time
+from calls
+order by caller_id, call_time asc;
+```
+
+### 6.2 — Growth-rate landmines: threshold, div-by-zero, gap-fill
+**Problem:** Month-over-month growth of long calls (> 5 min). **Three bugs, all invisible on the dense 6-month sample:**
+
+```sql
+-- ❌ BUG 1 — threshold: spec says "more than 300s" = strictly greater
+where call_duration_secs >= 300      -- wrongly counts exactly-300s calls
+
+-- ❌ BUG 2 — division by zero: a zero-count prior month makes Postgres
+--   RAISE a hard `division by zero` error (it does NOT return NULL)
+(cnt - lag(cnt) over (order by mth)) * 100.0 / lag(cnt) over (order by mth)
+
+-- ✅ FIX: strict >, and NULLIF the denominator
+where call_duration_secs > 300
+...
+round((cnt - lag(cnt) over (order by mth))::numeric * 100.0
+      / nullif(lag(cnt) over (order by mth), 0), 1)
+```
+**Secondary (gap-fill):** `date_trunc('month', ...)` only emits months that *appear* in the table. A month with zero calls is absent entirely, so `LAG` silently compares e.g. March to January and calls it "month-over-month." Real growth queries need `generate_series` for the full month range + `LEFT JOIN` the counts (missing → 0). NULL is the honest value for "growth from a zero base" (undefined) — same logic as why month 1 is NULL.
+
+### 6.3 — Ordered window with no unique tiebreaker
+**Problem:** Duplicate payment detection (`LAG` over `(merchant, card, amount)` by timestamp). Otherwise correct.
+**Trap:** `ORDER BY transaction_timestamp` alone. If two rows in a partition share the *exact* timestamp — and a retry-error duplicate charge is a prime candidate — `LAG` pairing is nondeterministic. Same shape as 6.1.
+
+```sql
+-- ❌ latent: ties on timestamp → nondeterministic LAG pairing
+over (partition by merchant_id, credit_card_id, amount order by transaction_timestamp)
+
+-- ✅ FIX: append the PK as a deterministic tiebreaker
+over (partition by merchant_id, credit_card_id, amount
+      order by transaction_timestamp asc, transaction_id asc)
+```
+**Generalized rule (now checklist #20):** any ordering-dependent window whose `ORDER BY` isn't guaranteed unique by the data needs an explicit PK tiebreaker — a default habit, not only when I notice a tie is possible. Hit this twice in one session (`DISTINCT ON` + `LAG`).
+
+### 6.4 — `HAVING <agg> > 0` deletes legitimate zero-count rows
+**Problem:** Monthly reactivated-user count.
+**Trap:** `HAVING sum(reactivated) > 0` filters my *own aggregation result*. A month where every login is a pure continuation (no reactivations) has a real answer of 0 — the HAVING deletes that row instead of reporting `0`. Passes the sample only because every sampled month happens to have ≥1 reactivation.
+
+```sql
+-- ❌ BUG: zero-reactivation months vanish from the output
+... group by mnt having sum(case when ... then 1 else 0 end) > 0
+
+-- ✅ FIX: drop the HAVING — a count of 0 IS the answer
+... group by mnt order by mnt;
+```
+Same family as 6.2's div-by-zero: a defensible-looking clause quietly removes a legitimate zero-value data point. Rule: never `HAVING <computed aggregate> > 0` unless the spec explicitly says "exclude empty groups."
 
 ---
 
@@ -382,8 +508,10 @@ select g, sum(x) from t group by g
 - **`::numeric` cast placement** — now reflexive and correct without prompting (confirmed on Wayfair YoY, 5.3).
 - **Typos / name drift** — was the #1 error source (Session 1), now near-zero after dropping the PySpark scaffold.
 - **Metacognition** — the "not sure it handles all edge cases" instinct has been a *reliable bug detector* every session. Also demonstrated good judgment knowing when to ask for help (Amazon Prime, 5.4) instead of thrashing. The remaining gap is acting on the checklist *before* submitting, not after being prompted.
+- **DataLemur Hard set — CLEARED.** All free Easy + Medium + Hard complete. The final Hard (AWS uptime, 8.1) was a clean solo solve with no bugs — event-log→sessions is now a default shape, not a puzzle.
+- **Bug-detection on others' code (new strength).** Session 6 was spotting *latent* correctness bugs in official solutions — nondeterministic windows, div-by-zero, zero-count drops — bugs that never surface on a small sample. This is precisely the review instinct interviews probe with "what breaks on the full dataset?" Strong signal for a Risk/FinCrime DE where silent data corruption is the whole job.
 
 ## 🎯 The one thing to fix next
-Across the Hard block, real correctness bugs (MAU wrong period, Amazon ROUND, advertiser FULL JOIN) all trace to a single default that isn't firing yet: **generate-then-filter instead of constrain-at-source** (see Session 5 theme + checklist #18). More problem volume won't fix this — deliberately re-solving the 3 buggy Hards under a "no DISTINCT, no join-back, no CASE ladder" constraint will. Do that *once*, then treat SQL as maintenance.
+DataLemur is done — more SQL volume is now low-ROI. The single persistent meta-gap across every session is unchanged: **I catch these bugs on review, not on first draft.** Sessions 6–8 prove I can *spot* nondeterminism, div-by-zero, and zero-drops in someone else's code — the transfer is to run the pre-submit checklist against my *own* query before submitting, not after being prompted. That's a 60-second habit, not a skill left to build. Next SQL touch = LeetCode SQL 50 as pure maintenance reps *inside* the Kafka phase.
 
-**Standing note:** SQL is maintenance-level, not the main event. Keep it to a daily rep and protect the Kafka + Spark Streaming window (starts 13 Jul) — that block is where the risk/streaming-fraud differentiation actually gets built. Remaining 6 Hards + LeetCode SQL 50 run *during* the Kafka phase as reps, not before it.
+**Standing note:** SQL is now officially maintenance-level — the DataLemur ladder is fully cleared. The main event starts **tomorrow (13 Jul): Kafka + Spark Structured Streaming** — the block where the risk/streaming-fraud differentiation actually gets built. Do not let SQL polishing (including maintaining this log) become a reason to slip that start date. LeetCode SQL 50 is a daily rep during the streaming block, never a substitute for it.
